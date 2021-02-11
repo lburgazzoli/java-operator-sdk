@@ -17,15 +17,22 @@ import io.javaoperatorsdk.quarkus.extension.QuarkusControllerConfiguration;
 import io.javaoperatorsdk.quarkus.extension.Version;
 import io.quarkus.arc.deployment.AdditionalBeanBuildItem;
 import io.quarkus.arc.deployment.SyntheticBeanBuildItem;
+import io.quarkus.deployment.GeneratedClassGizmoAdaptor;
 import io.quarkus.deployment.annotations.BuildProducer;
 import io.quarkus.deployment.annotations.BuildStep;
 import io.quarkus.deployment.annotations.ExecutionTime;
 import io.quarkus.deployment.annotations.Record;
 import io.quarkus.deployment.builditem.CombinedIndexBuildItem;
 import io.quarkus.deployment.builditem.FeatureBuildItem;
+import io.quarkus.deployment.builditem.GeneratedClassBuildItem;
 import io.quarkus.deployment.builditem.IndexDependencyBuildItem;
 import io.quarkus.deployment.builditem.nativeimage.ReflectiveClassBuildItem;
 import io.quarkus.deployment.util.JandexUtil;
+import io.quarkus.gizmo.ClassCreator;
+import io.quarkus.gizmo.MethodCreator;
+import io.quarkus.gizmo.MethodDescriptor;
+import java.lang.reflect.Modifier;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Function;
@@ -50,6 +57,13 @@ class QuarkusExtensionProcessor {
   private static final DotName CONTROLLER = DotName.createSimple(Controller.class.getName());
   private static final DotName APPLICATION_SCOPED =
       DotName.createSimple(ApplicationScoped.class.getName());
+  public static final Class<?>[] CUSTOM_RESOURCE_CTOR_PARAMETER_TYPES = Arrays
+      .stream(CustomResource.class.getDeclaredConstructors())
+      .filter(c -> c.getParameterCount() > 4)
+      .findFirst()
+      .map(c -> c.getParameterTypes())
+      .get();
+
 
   private ExternalConfiguration externalConfiguration;
 
@@ -69,13 +83,18 @@ class QuarkusExtensionProcessor {
       BuildProducer<SyntheticBeanBuildItem> syntheticBeanBuildItemBuildProducer,
       BuildProducer<AdditionalBeanBuildItem> additionalBeans,
       BuildProducer<ReflectiveClassBuildItem> reflectionClasses,
-      ConfigurationServiceRecorder recorder) {
+      ConfigurationServiceRecorder recorder,
+      BuildProducer<GeneratedClassBuildItem> generatedClass) {
     final var index = combinedIndexBuildItem.getIndex();
     final var resourceControllers = index.getAllKnownImplementors(RESOURCE_CONTROLLER);
 
+    final var classOutput = new GeneratedClassGizmoAdaptor(generatedClass, true);
     final List<ControllerConfiguration> controllerConfigs =
         resourceControllers.stream()
-            .map(ci -> createControllerConfiguration(ci, additionalBeans, reflectionClasses, index))
+            .map(
+                ci ->
+                    createControllerConfiguration(
+                        ci, additionalBeans, reflectionClasses, index, classOutput))
             .collect(Collectors.toList());
 
     final var version = Utils.loadFromProperties();
@@ -99,7 +118,8 @@ class QuarkusExtensionProcessor {
       ClassInfo info,
       BuildProducer<AdditionalBeanBuildItem> additionalBeans,
       BuildProducer<ReflectiveClassBuildItem> reflectionClasses,
-      IndexView index) {
+      IndexView index,
+      GeneratedClassGizmoAdaptor classOutput) {
     // first retrieve the custom resource class
     final var crType =
         JandexUtil.resolveTypeParameters(info.name(), RESOURCE_CONTROLLER, index)
@@ -122,9 +142,41 @@ class QuarkusExtensionProcessor {
     // Instantiate CR to check that it's properly annotated
     final CustomResource cr;
     try {
-      cr = crClass.getConstructor().newInstance();
+      cr = crClass.getDeclaredConstructor().newInstance();
     } catch (Exception e) {
       throw new IllegalArgumentException(e.getCause());
+    }
+    
+    // generate optimized CustomResource class
+    final var optimizedCR = crType + "_Generated";
+    try (ClassCreator cc =
+        ClassCreator.builder()
+    /*.signature(
+    String.format(
+        "Lio/fabric8/kubernetes/client/CustomResourceDoneable<L%s;>;",
+        crType.replace('.', '/')))*/
+            .classOutput(classOutput)
+            .className(optimizedCR)
+            .superClass(crType)
+            .build()) {
+
+      // create default no-arg constructor
+      MethodCreator ctor = cc.getMethodCreator("<init>", void.class.getName());
+      ctor.setModifiers(Modifier.PUBLIC);
+      // S spec, T status, String kind, String group, String version, String singular, String plural, String scope, boolean served, boolean storage
+      try {
+        ctor.invokeSpecialMethod(
+            MethodDescriptor.ofConstructor(crType, CUSTOM_RESOURCE_CTOR_PARAMETER_TYPES),
+            ctor.getThis(),
+            ctor.invokeVirtualMethod(MethodDescriptor.ofMethod(crClass.getMethod("getSpec")),
+                )
+        );
+      } catch (NoSuchMethodException e) {
+        e.printStackTrace();
+      }
+      ctor.returnValue(null);
+
+      //      cc.getMethodCreator(MethodDescriptor.ofMethod())
     }
 
     // retrieve CRD name from CR type
