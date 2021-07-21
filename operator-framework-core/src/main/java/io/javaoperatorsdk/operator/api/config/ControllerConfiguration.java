@@ -2,6 +2,8 @@ package io.javaoperatorsdk.operator.api.config;
 
 import io.fabric8.kubernetes.client.CustomResource;
 import io.javaoperatorsdk.operator.api.Controller;
+import io.javaoperatorsdk.operator.processing.event.internal.CustomResourcePredicate;
+import io.javaoperatorsdk.operator.processing.event.internal.CustomResourcePredicates;
 import java.util.Collections;
 import java.util.Set;
 
@@ -71,5 +73,11 @@ public interface ControllerConfiguration<R extends CustomResource> {
 
   default boolean useFinalizer() {
     return !Controller.NO_FINALIZER.equals(getFinalizer());
+  }
+
+  default CustomResourcePredicate<R> getPredicate() {
+    return isGenerationAware()
+        ? CustomResourcePredicates.generationAware()
+        : CustomResourcePredicates.passthrough();
   }
 }

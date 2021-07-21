@@ -17,9 +17,7 @@ import io.javaoperatorsdk.operator.processing.KubernetesResourceUtils;
 import io.javaoperatorsdk.operator.processing.event.AbstractEventSource;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,10 +31,10 @@ public class CustomResourceEventSource<T extends CustomResource<?, ?>> extends A
   private final Set<String> targetNamespaces;
   private final boolean generationAware;
   private final String resourceFinalizer;
-  private final Map<String, Long> lastGenerationProcessedSuccessfully = new ConcurrentHashMap<>();
   private final List<Watch> watches;
   private final String resClass;
-  private final CustomResourceCache customResourceCache;
+  private final CustomResourceCache<T> customResourceCache;
+  private final CustomResourcePredicate<T> predicate;
 
   public CustomResourceEventSource(
       MixedOperation<T, KubernetesResourceList<T>, Resource<T>> client,
@@ -47,22 +45,8 @@ public class CustomResourceEventSource<T extends CustomResource<?, ?>> extends A
         configuration.isGenerationAware(),
         configuration.getFinalizer(),
         configuration.getCustomResourceClass(),
-        new CustomResourceCache(configuration.getConfigurationService().getObjectMapper()));
-  }
-
-  CustomResourceEventSource(
-      MixedOperation<T, KubernetesResourceList<T>, Resource<T>> client,
-      Set<String> targetNamespaces,
-      boolean generationAware,
-      String resourceFinalizer,
-      Class<T> resClass) {
-    this(
-        client,
-        targetNamespaces,
-        generationAware,
-        resourceFinalizer,
-        resClass,
-        new CustomResourceCache());
+        new CustomResourceCache<>(configuration.getConfigurationService().getObjectMapper()),
+        configuration.getPredicate());
   }
 
   CustomResourceEventSource(
@@ -71,7 +55,25 @@ public class CustomResourceEventSource<T extends CustomResource<?, ?>> extends A
       boolean generationAware,
       String resourceFinalizer,
       Class<T> resClass,
-      CustomResourceCache customResourceCache) {
+      CustomResourcePredicate<T> predicate) {
+    this(
+        client,
+        targetNamespaces,
+        generationAware,
+        resourceFinalizer,
+        resClass,
+        new CustomResourceCache<>(),
+        predicate);
+  }
+
+  CustomResourceEventSource(
+      MixedOperation<T, KubernetesResourceList<T>, Resource<T>> client,
+      Set<String> targetNamespaces,
+      boolean generationAware,
+      String resourceFinalizer,
+      Class<T> resClass,
+      CustomResourceCache customResourceCache,
+      CustomResourcePredicate<T> predicates) {
     this.client = client;
     this.targetNamespaces = targetNamespaces;
     this.generationAware = generationAware;
@@ -79,6 +81,7 @@ public class CustomResourceEventSource<T extends CustomResource<?, ?>> extends A
     this.watches = new ArrayList<>();
     this.resClass = resClass.getName();
     this.customResourceCache = customResourceCache;
+    this.predicate = predicates;
   }
 
   @Override
@@ -115,6 +118,9 @@ public class CustomResourceEventSource<T extends CustomResource<?, ?>> extends A
     log.debug(
         "Event received for action: {}, resource: {}", action.name(), getName(customResource));
 
+    final String uuid = KubernetesResourceUtils.getUID(customResource);
+    final T oldResource = customResourceCache.getLatestResource(uuid).orElse(null);
+
     // cache the latest version of the CR
     customResourceCache.cacheResource(customResource);
 
@@ -127,46 +133,16 @@ public class CustomResourceEventSource<T extends CustomResource<?, ?>> extends A
       return;
     }
 
-    if (!skipBecauseOfGeneration(customResource)) {
-      eventHandler.handleEvent(new CustomResourceEvent(action, customResource, this));
-      markLastGenerationProcessed(customResource);
-    } else {
+    if (!predicate.test(oldResource, customResource)) {
       log.debug(
           "Skipping event handling resource {} with version: {}",
           getUID(customResource),
           getVersion(customResource));
-    }
-  }
 
-  private void markLastGenerationProcessed(T resource) {
-    if (generationAware && resource.hasFinalizer(resourceFinalizer)) {
-      lastGenerationProcessedSuccessfully.put(
-          KubernetesResourceUtils.getUID(resource), resource.getMetadata().getGeneration());
-    }
-  }
-
-  private boolean skipBecauseOfGeneration(T customResource) {
-    if (!generationAware) {
-      return false;
-    }
-    // if CR being deleted generation is naturally not changing, so we process all the events
-    if (customResource.isMarkedForDeletion()) {
-      return false;
+      return;
     }
 
-    // only proceed if we haven't already seen this custom resource generation
-    Long lastGeneration =
-        lastGenerationProcessedSuccessfully.get(customResource.getMetadata().getUid());
-    if (lastGeneration == null) {
-      return false;
-    } else {
-      return customResource.getMetadata().getGeneration() <= lastGeneration;
-    }
-  }
-
-  @Override
-  public void eventSourceDeRegisteredForResource(String customResourceUid) {
-    lastGenerationProcessedSuccessfully.remove(customResourceUid);
+    eventHandler.handleEvent(new CustomResourceEvent(action, customResource, this));
   }
 
   @Override
@@ -192,7 +168,7 @@ public class CustomResourceEventSource<T extends CustomResource<?, ?>> extends A
   }
 
   // todo: remove
-  public CustomResourceCache getCache() {
+  public CustomResourceCache<T> getCache() {
     return customResourceCache;
   }
 }

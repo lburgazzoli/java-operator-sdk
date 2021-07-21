@@ -19,12 +19,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 @SuppressWarnings("rawtypes")
-public class CustomResourceCache {
+public class CustomResourceCache<T extends CustomResource<?, ?>> {
 
   private static final Logger log = LoggerFactory.getLogger(CustomResourceCache.class);
 
   private final ObjectMapper objectMapper;
-  private final ConcurrentMap<String, CustomResource> resources = new ConcurrentHashMap<>();
+  private final ConcurrentMap<String, T> resources = new ConcurrentHashMap<>();
   private final Lock lock = new ReentrantLock();
 
   public CustomResourceCache() {
@@ -35,21 +35,24 @@ public class CustomResourceCache {
     this.objectMapper = objectMapper;
   }
 
-  public void cacheResource(CustomResource resource) {
+  public void cacheResource(T resource) {
     try {
       lock.lock();
-      resources.put(KubernetesResourceUtils.getUID(resource), resource);
+
+      // defensive copy
+      resources.put(KubernetesResourceUtils.getUID(resource), clone(resource));
     } finally {
       lock.unlock();
     }
   }
 
-  public void cacheResource(CustomResource resource, Predicate<CustomResource> predicate) {
+  public void cacheResource(T resource, Predicate<CustomResource> predicate) {
     try {
       lock.lock();
       if (predicate.test(resources.get(KubernetesResourceUtils.getUID(resource)))) {
         log.trace("Update cache after condition is true: {}", getName(resource));
-        resources.put(getUID(resource), resource);
+        // defensive copy
+        resources.put(getUID(resource), clone(resource));
       }
     } finally {
       lock.unlock();
@@ -63,11 +66,11 @@ public class CustomResourceCache {
    * @param uuid
    * @return
    */
-  public Optional<CustomResource> getLatestResource(String uuid) {
+  public Optional<T> getLatestResource(String uuid) {
     return Optional.ofNullable(resources.get(uuid)).map(this::clone);
   }
 
-  public List<CustomResource> getLatestResources(Predicate<CustomResource> selector) {
+  public List<T> getLatestResources(Predicate<CustomResource> selector) {
     try {
       lock.lock();
       return resources.values().stream()
@@ -91,16 +94,18 @@ public class CustomResourceCache {
     }
   }
 
-  private CustomResource clone(CustomResource customResource) {
+  @SuppressWarnings("unchecked")
+  private T clone(CustomResource customResource) {
     try {
-      return objectMapper.readValue(
-          objectMapper.writeValueAsString(customResource), customResource.getClass());
+      return (T)
+          objectMapper.readValue(
+              objectMapper.writeValueAsString(customResource), customResource.getClass());
     } catch (JsonProcessingException e) {
       throw new IllegalStateException(e);
     }
   }
 
-  public CustomResource cleanup(String customResourceUid) {
+  public T cleanup(String customResourceUid) {
     return resources.remove(customResourceUid);
   }
 }
